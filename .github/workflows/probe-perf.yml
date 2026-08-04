@@ -1,0 +1,117 @@
+name: Perf probe
+
+# Throwaway workflow. Answers two questions with runner data rather than
+# guesswork: which perf events a GitHub runner actually exposes, and what
+# callgrind costs on the pinned CoreMark workload.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [probe-perf]
+
+jobs:
+  probe:
+    name: Probe (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86
+            runner: ubuntu-latest
+          - label: linux-arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Machine
+        run: |
+          uname -a
+          lscpu || true
+          nproc
+
+      - name: What perf can see
+        continue-on-error: true
+        run: |
+          echo "--- perf_event_paranoid ---"
+          cat /proc/sys/kernel/perf_event_paranoid || true
+          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
+
+          echo "--- PMUs exposed to the guest ---"
+          ls /sys/bus/event_source/devices/ || true
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends linux-tools-common linux-tools-generic || true
+
+          PERF=$(command -v perf || true)
+          if [ -z "$PERF" ]; then
+            PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -n 1 || true)
+          fi
+          echo "perf binary: ${PERF:-none}"
+          [ -n "$PERF" ] || exit 0
+
+          echo "--- perf list (hardware section) ---"
+          "$PERF" list || true
+
+          echo "--- perf stat, default event set ---"
+          "$PERF" stat true || true
+
+          echo "--- perf stat, the events a work proxy would need ---"
+          "$PERF" stat -e task-clock,instructions,cycles,branches,branch-misses true || true
+
+      - name: Install Valgrind (timed)
+        run: |
+          set -euo pipefail
+          start=$(date +%s.%N)
+          sudo apt-get update
+          mid=$(date +%s.%N)
+          sudo apt-get install --assume-yes --no-install-recommends valgrind
+          end=$(date +%s.%N)
+          echo "apt-get update:  $(echo "$mid - $start" | bc)s"
+          echo "install valgrind: $(echo "$end - $mid" | bc)s"
+          valgrind --version
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the bench
+        id: build
+        run: |
+          set -euo pipefail
+          exe=$(cargo bench -p spacewasm_std --bench coremark --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact")
+                     | select(.target.kind | index("bench"))
+                     | select(.target.name == "coremark")
+                     | .executable' \
+            | tail -n 1)
+          echo "exe=$exe" >> "$GITHUB_OUTPUT"
+          ls -l "$exe"
+
+      - name: What the measurement costs
+        run: |
+          set -euo pipefail
+          exe='${{ steps.build.outputs.exe }}'
+
+          echo "=== pinned workload, native, three runs ==="
+          for i in 1 2 3; do
+            COREMARK_FIXED_CLOCK=1 /usr/bin/time -f "pinned native run $i: %e s" "$exe" \
+              | grep -E 'CoreMark Score|Execution time' || true
+          done
+
+          echo "=== pinned workload, under callgrind ==="
+          COREMARK_FIXED_CLOCK=1 /usr/bin/time -f "pinned callgrind: %e s" \
+            valgrind --tool=callgrind --cache-sim=no --branch-sim=no \
+            --callgrind-out-file=/tmp/cg.out "$exe" \
+            | grep -E 'CoreMark Score' || true
+          awk '/^(summary|totals):/ { print "Ir: " $2; exit }' /tmp/cg.out
+
+          echo "=== pinned workload, under callgrind, second run (repeatability) ==="
+          COREMARK_FIXED_CLOCK=1 /usr/bin/time -f "pinned callgrind: %e s" \
+            valgrind --tool=callgrind --cache-sim=no --branch-sim=no \
+            --callgrind-out-file=/tmp/cg2.out "$exe" > /dev/null
+          awk '/^(summary|totals):/ { print "Ir: " $2; exit }' /tmp/cg2.out
+
+          echo "=== full timed workload, native, what a sample costs today ==="
+          /usr/bin/time -f "timed sample: %e s" "$exe" | grep -E 'CoreMark Score' || true

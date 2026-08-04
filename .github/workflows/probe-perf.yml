@@ -1,8 +1,9 @@
 name: Perf probe
 
-# Throwaway workflow. Answers two questions with runner data rather than
-# guesswork: which perf events a GitHub runner actually exposes, and what
-# callgrind costs on the pinned CoreMark workload.
+# Throwaway workflow. The first pass established that ubuntu-latest exposes no
+# PMU while ubuntu-24.04-arm exposes armv8_pmuv3_0. This pass asks whether a
+# hardware instruction count on the ARM runner is repeatable enough to compare
+# two builds: within one machine, and across two machines.
 
 on:
   workflow_dispatch:
@@ -17,9 +18,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: linux-x86
-            runner: ubuntu-latest
-          - label: linux-arm64
+          - label: arm-a
+            runner: ubuntu-24.04-arm
+          - label: arm-b
             runner: ubuntu-24.04-arm
 
     steps:
@@ -29,49 +30,33 @@ jobs:
       - name: Machine
         run: |
           uname -a
-          lscpu || true
-          nproc
+          lscpu | head -n 25 || true
 
-      - name: What perf can see
-        continue-on-error: true
+      - name: perf as the image ships it
         run: |
-          echo "--- perf_event_paranoid ---"
-          cat /proc/sys/kernel/perf_event_paranoid || true
-          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
+          echo "perf preinstalled: $(command -v perf || echo no)"
+          echo "perf_event_paranoid: $(cat /proc/sys/kernel/perf_event_paranoid)"
+          # Counting a process you started yourself needs paranoid <= 2.
+          perf stat -e instructions:u true 2>&1 | tail -n 8 || true
 
-          echo "--- PMUs exposed to the guest ---"
-          ls /sys/bus/event_source/devices/ || true
-
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends linux-tools-common linux-tools-generic || true
-
-          PERF=$(command -v perf || true)
-          if [ -z "$PERF" ]; then
-            PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -n 1 || true)
+      - name: Install perf if needed (timed)
+        run: |
+          start=$(date +%s.%N)
+          if ! command -v perf > /dev/null; then
+            sudo apt-get update
+            sudo apt-get install --assume-yes --no-install-recommends \
+              linux-tools-common linux-tools-generic
           fi
-          echo "perf binary: ${PERF:-none}"
-          [ -n "$PERF" ] || exit 0
-
-          echo "--- perf list (hardware section) ---"
-          "$PERF" list || true
-
-          echo "--- perf stat, default event set ---"
-          "$PERF" stat true || true
-
-          echo "--- perf stat, the events a work proxy would need ---"
-          "$PERF" stat -e task-clock,instructions,cycles,branches,branch-misses true || true
+          end=$(date +%s.%N)
+          echo "perf install: $(echo "$end - $start" | bc)s"
 
       - name: Install Valgrind (timed)
         run: |
-          set -euo pipefail
           start=$(date +%s.%N)
           sudo apt-get update
-          mid=$(date +%s.%N)
           sudo apt-get install --assume-yes --no-install-recommends valgrind
           end=$(date +%s.%N)
-          echo "apt-get update:  $(echo "$mid - $start" | bc)s"
-          echo "install valgrind: $(echo "$end - $mid" | bc)s"
-          valgrind --version
+          echo "valgrind install: $(echo "$end - $start" | bc)s"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -87,31 +72,36 @@ jobs:
                      | .executable' \
             | tail -n 1)
           echo "exe=$exe" >> "$GITHUB_OUTPUT"
-          ls -l "$exe"
+          sha256sum "$exe"
 
-      - name: What the measurement costs
+      - name: Hardware instruction count, ten runs
         run: |
           set -euo pipefail
           exe='${{ steps.build.outputs.exe }}'
+          PERF=$(command -v perf || ls /usr/lib/linux-tools/*/perf | head -n 1)
 
-          echo "=== pinned workload, native, three runs ==="
-          for i in 1 2 3; do
-            COREMARK_FIXED_CLOCK=1 /usr/bin/time -f "pinned native run $i: %e s" "$exe" \
-              | grep -E 'CoreMark Score|Execution time' || true
+          # User-space only, so kernel work on the runner's behalf does not
+          # land in the figure.
+          for i in $(seq 1 10); do
+            COREMARK_FIXED_CLOCK=1 "$PERF" stat -x, -e instructions:u,task-clock \
+              -o "/tmp/perf.$i" "$exe" > /dev/null
+            insns=$(awk -F, '$3 == "instructions:u" { print $1 }' "/tmp/perf.$i")
+            echo "run $i: $insns"
           done
 
-          echo "=== pinned workload, under callgrind ==="
-          COREMARK_FIXED_CLOCK=1 /usr/bin/time -f "pinned callgrind: %e s" \
-            valgrind --tool=callgrind --cache-sim=no --branch-sim=no \
-            --callgrind-out-file=/tmp/cg.out "$exe" \
-            | grep -E 'CoreMark Score' || true
-          awk '/^(summary|totals):/ { print "Ir: " $2; exit }' /tmp/cg.out
+      - name: Same thing under callgrind, twice, timed
+        run: |
+          set -euo pipefail
+          exe='${{ steps.build.outputs.exe }}'
+          for i in 1 2; do
+            COREMARK_FIXED_CLOCK=1 /usr/bin/time -f "callgrind run $i: %e s" \
+              valgrind --tool=callgrind --cache-sim=no --branch-sim=no \
+              --callgrind-out-file="/tmp/cg.$i" "$exe" > /dev/null
+            awk '/^(summary|totals):/ { print "Ir: " $2; exit }' "/tmp/cg.$i"
+          done
 
-          echo "=== pinned workload, under callgrind, second run (repeatability) ==="
-          COREMARK_FIXED_CLOCK=1 /usr/bin/time -f "pinned callgrind: %e s" \
-            valgrind --tool=callgrind --cache-sim=no --branch-sim=no \
-            --callgrind-out-file=/tmp/cg2.out "$exe" > /dev/null
-          awk '/^(summary|totals):/ { print "Ir: " $2; exit }' /tmp/cg2.out
-
-          echo "=== full timed workload, native, what a sample costs today ==="
+      - name: What a timed sample costs here
+        run: |
+          set -euo pipefail
+          exe='${{ steps.build.outputs.exe }}'
           /usr/bin/time -f "timed sample: %e s" "$exe" | grep -E 'CoreMark Score' || true

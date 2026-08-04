@@ -80,6 +80,10 @@ jobs:
           exe='${{ steps.build.outputs.exe }}'
           PERF=$(command -v perf || ls /usr/lib/linux-tools/*/perf | head -n 1)
 
+          # The image ships paranoid=4, which refuses even to count a process
+          # you started yourself. Passwordless sudo is available on the runner.
+          sudo sysctl -w kernel.perf_event_paranoid=1
+
           # User-space only, so kernel work on the runner's behalf does not
           # land in the figure.
           for i in $(seq 1 10); do
